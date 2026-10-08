@@ -1,0 +1,15 @@
+# ROMs are supplied separately, including any paid downloads.
+*.[gG][bB]
+*.[gG][bB][cC]
+/roms/
+
+# Local downloads, vendor cache, and device/ROM operation logs.
+/downloads/
+/tools/
+/logs/
+node_modules/
+*.tgz
+
+__pycache__/
+*.py[cod]
+.DS_Store
