@@ -9,6 +9,7 @@ import { basename, dirname, extname, join, resolve } from 'node:path';
 import { createInterface } from 'node:readline/promises';
 import { fileURLToPath } from 'node:url';
 import { parseArgs } from 'node:util';
+import { assessCompatibility, decodeRequirements, DEMO_CARTRIDGE, formatInspection } from './compatibility.mjs';
 
 export const ROOT = dirname(fileURLToPath(import.meta.url));
 const require = createRequire(import.meta.url);
@@ -43,7 +44,7 @@ export function inspectRom(filename) {
   const titleBytes = data.subarray(0x134, data[0x143] & 0x80 ? 0x143 : 0x144);
   const title = Array.from(titleBytes.subarray(0, titleBytes.indexOf(0) < 0 ? titleBytes.length : titleBytes.indexOf(0)))
     .map(byte => byte < 128 ? String.fromCharCode(byte) : '\ufffd').join('');
-  return {
+  const rom = {
     path, title, size_bytes: data.length,
     sha256: createHash('sha256').update(data).digest('hex'),
     cartridge_type_code: data[0x147], cgb_flag: data[0x143],
@@ -51,6 +52,7 @@ export function inspectRom(filename) {
     header_checksum: checksum, global_checksum: globalChecksum,
     computed_global_checksum: computedGlobal, global_checksum_valid: globalChecksum === computedGlobal,
   };
+  return { ...rom, requirements: decodeRequirements(rom) };
 }
 
 export function resolveCli() {
@@ -114,6 +116,9 @@ export class Session {
     if (!isObject(payload.result)) {
       throw new WorkflowError(`${operation} returned an unexpected JSON result. See ${this.logs}.`);
     }
+    if (payload.operation !== operation) {
+      throw new WorkflowError(`${operation} returned a response for a different operation. See ${this.logs}.`);
+    }
     return payload.result;
   }
 }
@@ -140,6 +145,20 @@ export function verifyHeader(cartridge, rom) {
   if (mismatches.length) throw new WorkflowError(`Cartridge header differs from the ROM: ${mismatches.join(', ')}`);
 }
 
+export function assertCompatibility(report, allowUnknown = false) {
+  if (report.status === 'incompatible') {
+    throw new WorkflowError(`Incompatible with the DevDay demo cartridge: ${report.reasons.join(' ')}`);
+  }
+  if (report.status === 'unknown' && !allowUnknown) {
+    throw new WorkflowError(`Unknown compatibility: ${report.reasons.join(' ')} Use --allow-unknown-compatibility only to deliberately try an unverified ROM; --yes does not override compatibility.`);
+  }
+}
+
+export function verifyWriteResult(result, rom, player) {
+  if (result.player !== player) throw new WorkflowError('Write result reports a different or missing player number.');
+  if (result.romSha256 !== rom.sha256) throw new WorkflowError('Write result reports a different or missing host ROM SHA-256.');
+}
+
 export function withDeviceReset(session, player, action) {
   const devices = session.run('list-devices').devices;
   if (!Array.isArray(devices) || !devices.some(device => device.player === player)) {
@@ -158,17 +177,63 @@ export function withDeviceReset(session, player, action) {
   }
 }
 
-export function flash(session, rom, player) {
-  withDeviceReset(session, player, options => {
-    const before = session.run('detect-cart', '--all', ...options).cartridge;
-    session.save('cartridge-before', before);
-    checkCapacity(before, rom);
-    session.save('rom', rom);
-    session.run('write-homebrew', rom.path, '--expect-sha256', rom.sha256, ...options);
-    const after = session.run('detect-cart', '--all', ...options).cartridge;
-    session.save('cartridge-after', after);
-    verifyHeader(after, rom);
+export function check(session, rom, player, { profile = DEMO_CARTRIDGE } = {}) {
+  return withDeviceReset(session, player, options => {
+    const cartridge = session.run('detect-cart', '--all', ...options).cartridge ?? null;
+    session.save('cartridge-before', cartridge);
+    const report = assessCompatibility(rom, { profile, cartridge });
+    session.save('compatibility', report);
+    return report;
   });
+}
+
+export function flash(session, rom, player, { profile = DEMO_CARTRIDGE, allowUnknown = false } = {}) {
+  assertCompatibility(assessCompatibility(rom, { profile }), allowUnknown);
+  const verification = {
+    profile_id: profile.id, requested_player: player, host_rom_sha256: rom.sha256,
+    outcome: 'pending', cartridge_profile_before: 'not_checked', cartridge_profile_after: 'not_checked', cli_player_and_host_hash: 'not_checked',
+    cartridge_header: 'not_checked', device_reset: 'not_confirmed',
+    full_flash_readback: 'unavailable_in_cli_1.2.1',
+    gameplay: 'not_tested_by_this_run', save_persistence: 'not_tested_by_this_run',
+  };
+  session.save('verification', verification);
+  try {
+    withDeviceReset(session, player, options => {
+      const before = session.run('detect-cart', '--all', ...options).cartridge ?? null;
+      session.save('cartridge-before', before);
+      const report = assessCompatibility(rom, { profile, cartridge: before });
+      session.save('compatibility', { ...report, unknown_compatibility_override: allowUnknown && report.status === 'unknown' });
+      verification.cartridge_profile_before = report.hardware_match;
+      session.save('verification', verification);
+      checkCapacity(before, rom);
+      assertCompatibility(report, allowUnknown);
+      session.save('rom', rom);
+      session.save('verification', verification);
+      const written = session.run('write-homebrew', rom.path, '--expect-sha256', rom.sha256, ...options);
+      verifyWriteResult(written, rom, player);
+      verification.cli_player_and_host_hash = 'matched';
+      session.save('verification', verification);
+      const after = session.run('detect-cart', '--all', ...options).cartridge ?? null;
+      session.save('cartridge-after', after);
+      const afterReport = assessCompatibility(rom, { profile, cartridge: after });
+      session.save('compatibility-after', afterReport);
+      verification.cartridge_profile_after = afterReport.hardware_match;
+      session.save('verification', verification);
+      assertCompatibility(afterReport, allowUnknown);
+      verifyHeader(after, rom);
+      verification.cartridge_header = 'matched';
+      session.save('verification', verification);
+    });
+    verification.device_reset = 'completed';
+    verification.outcome = 'completed';
+    session.save('verification', verification);
+    return verification;
+  } catch (error) {
+    verification.outcome = 'failed';
+    verification.error = error.message;
+    session.save('verification', verification);
+    throw error;
+  }
 }
 
 export function installDrivers({
@@ -198,16 +263,20 @@ async function confirm(message) {
 }
 
 const HELP = `Usage: node modretro.mjs <command> [ROM] [options]
-Commands: devices, drivers, inspect, detect, flash
+Commands: devices, drivers, inspect, check, detect, flash
+Target: Codex / OpenAI DevDay demo cartridge; ISSI IS29GL032-70TLET-TR (4 MiB)
 Options:
   --player N   Select the Chromatic (default: 1)
   --yes        Confirm reset/replacement; for drivers, skip the vendor prompt
-  --dry-run    Check the ROM and show the write command without CLI/USB access
+  --dry-run    Run offline flash checks and preview the wrapper command
+  --json       Machine-readable output for inspect/check
+  --allow-unknown-compatibility   Explicitly try unverified hardware requirements
   --allow-invalid-global-checksum  Allow a known stale whole-ROM checksum
 Examples:
   npm ci
   npm run devices
   npm run inspect -- /path/to/game.gbc
+  npm run check -- /path/to/game.gbc --player 1
   npm run flash -- /path/to/game.gbc --dry-run
   npm run flash -- /path/to/game.gbc --player 1`;
 
@@ -217,15 +286,16 @@ export async function main(argv = process.argv.slice(2), {
   const { positionals, values } = parseArgs({ args: argv, allowPositionals: true, options: {
     help: { type: 'boolean', short: 'h' }, player: { type: 'string' }, yes: { type: 'boolean' },
     'dry-run': { type: 'boolean' }, 'allow-invalid-global-checksum': { type: 'boolean' },
+    json: { type: 'boolean' }, 'allow-unknown-compatibility': { type: 'boolean' },
   } });
   const [command, filename] = positionals;
   if (values.help || !command) { print(HELP); return 0; }
-  if (!['devices', 'drivers', 'inspect', 'detect', 'flash'].includes(command)) throw new WorkflowError(`Unknown command: ${command}`);
-  const takesRom = ['inspect', 'flash'].includes(command);
+  if (!['devices', 'drivers', 'inspect', 'check', 'detect', 'flash'].includes(command)) throw new WorkflowError(`Unknown command: ${command}`);
+  const takesRom = ['inspect', 'check', 'flash'].includes(command);
   if (positionals.length !== (takesRom ? 2 : 1)) throw new WorkflowError(takesRom ? 'Provide one .gb or .gbc path.' : 'Unexpected positional arguments.');
   const permitted = {
-    devices: [], drivers: ['yes'], inspect: [], detect: ['player', 'yes'],
-    flash: ['player', 'yes', 'dry-run', 'allow-invalid-global-checksum'],
+    devices: [], drivers: ['yes'], inspect: ['json'], check: ['player', 'yes', 'json'], detect: ['player', 'yes'],
+    flash: ['player', 'yes', 'dry-run', 'allow-invalid-global-checksum', 'allow-unknown-compatibility'],
   }[command];
   for (const flag of Object.keys(values)) {
     if (!permitted.includes(flag)) throw new WorkflowError(`--${flag} is not valid for ${command}.`);
@@ -236,22 +306,35 @@ export async function main(argv = process.argv.slice(2), {
   if (command === 'devices') { print(json(sessionFactory().run('list-devices'))); return 0; }
   if (takesRom) {
     const rom = inspectRom(filename);
-    print(json(rom));
+    const compatibility = assessCompatibility(rom);
+    const show = report => print(values.json ? json({ ...rom, compatibility: report }) : formatInspection(rom, report));
+    if (command !== 'check') show(compatibility);
     if (command === 'inspect') return 0;
+    if (command === 'check') {
+      if (!values.yes && !await ask(`Checking player ${player} resets the Chromatic but does not write a ROM. Save your game first.`)) {
+        print(values.json ? json({ cancelled: true }) : 'Cancelled; device unchanged.'); return 0;
+      }
+      const report = check(sessionFactory(), rom, player);
+      show(report);
+      return !rom.global_checksum_valid || report.status === 'incompatible' ? 1 : report.status === 'unknown' ? 2 : 0;
+    }
     if (!rom.global_checksum_valid && !values['allow-invalid-global-checksum']) {
       throw new WorkflowError('Whole-ROM checksum is invalid. Check the file; use --allow-invalid-global-checksum only for a known stale checksum.');
     }
+    const allowUnknown = values['allow-unknown-compatibility'] === true;
+    assertCompatibility(compatibility, allowUnknown);
     if (values['dry-run']) {
       const quote = value => `'${value.replaceAll("'", "'\\''")}'`;
-      print(`npm run cli -- write-homebrew ${quote(rom.path)} --expect-sha256 ${rom.sha256} --player ${player}`);
+      print(`npm run flash -- ${quote(rom.path)} --player ${player}${allowUnknown ? ' --allow-unknown-compatibility' : ''}${values['allow-invalid-global-checksum'] ? ' --allow-invalid-global-checksum' : ''}${values.yes ? ' --yes' : ''}`);
       print('Dry run complete; no CLI commands or USB operations were performed.');
       return 0;
     }
+    if (allowUnknown && compatibility.status === 'unknown') print('Explicit override: hardware compatibility remains UNKNOWN; successful writing does not establish playability or save support.');
     if (!values.yes && !await ask(`Replace the cartridge ROM on player ${player} with ${basename(rom.path)}? This resets the Chromatic; save your game first.`)) {
       print('Cancelled; cartridge unchanged.'); return 0;
     }
-    flash(sessionFactory(), rom, player);
-    print('Flash complete. Cartridge header matches the ROM; Chromatic reset to start the game.');
+    flash(sessionFactory(), rom, player, { allowUnknown });
+    print('Flash complete. Demo chip profile, CLI player/host hash, and cartridge header checked; Chromatic reset. Full-flash readback, gameplay, and save persistence were not tested by this run.');
   } else {
     if (!values.yes && !await ask(`Inspecting player ${player} resets the Chromatic. Save your game first.`)) {
       print('Cancelled; device unchanged.'); return 0;

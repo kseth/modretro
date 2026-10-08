@@ -3,7 +3,8 @@ import { mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from '
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
-import { CLI_VERSION, Session, WorkflowError, flash, inspectRom, installDrivers, main } from '../modretro.mjs';
+import { CLI_VERSION, Session, WorkflowError, check, flash, inspectRom, installDrivers, main } from '../modretro.mjs';
+import { DEMO_CARTRIDGE } from '../compatibility.mjs';
 
 // These buffers are generated test data, not copies of any game ROM.
 function fixture(t, { sizeCode = 0, title = 'TEST ROM', cgbFlag = 0x80, type = 0, ram = 0 } = {}) {
@@ -21,19 +22,23 @@ function fixture(t, { sizeCode = 0, title = 'TEST ROM', cgbFlag = 0x80, type = 0
 }
 
 class FakeSession {
-  constructor(rom, { capacity = 4194304, writable = true, badHeader = false, failWrite = false, failReset = false } = {}) {
-    Object.assign(this, { rom, capacity, writable, badHeader, failWrite, failReset });
+  constructor(rom, { capacity = 4194304, writable = true, badHeader = false, failWrite = false, failReset = false,
+    flashOverrides = {}, afterFlashOverrides = {}, writeResult = {} } = {}) {
+    Object.assign(this, { rom, capacity, writable, badHeader, failWrite, failReset, flashOverrides, afterFlashOverrides, writeResult });
     this.calls = []; this.warnings = [];
+    this.saved = new Map();
   }
-  save() {}
+  save(name, value) { this.saved.set(name, structuredClone(value)); }
   report = message => this.warnings.push(message);
   run(operation, ...options) {
     this.calls.push({ operation, options });
     if (operation === 'list-devices') return { devices: [{ player: 1 }] };
     if (operation === 'write-homebrew' && this.failWrite) throw new WorkflowError('simulated write failure');
+    if (operation === 'write-homebrew') return { player: 1, romSha256: this.rom.sha256, ...this.writeResult };
     if (operation === 'reset-device' && this.failReset) throw new WorkflowError('simulated reset failure');
     if (operation === 'detect-cart') return { cartridge: {
-      flash: this.writable ? { capacity_bytes: this.capacity } : null,
+      flash: this.writable ? { ...DEMO_CARTRIDGE.flash, capacity_bytes: this.capacity, ...this.flashOverrides,
+        ...(this.calls.some(call => call.operation === 'write-homebrew') ? this.afterFlashOverrides : {}) } : null,
       header: {
         cartridge_type_code: this.rom.cartridge_type_code, cgb_flag: this.rom.cgb_flag,
         stored_header_checksum: this.rom.header_checksum, header_checksum: 'valid',
@@ -47,6 +52,7 @@ class FakeSession {
 }
 const quiet = { print() {} };
 const mustNotAccessDevice = () => { throw new Error('Unexpected CLI/device access'); };
+const tryUnverified = (session, rom, player = 1) => flash(session, rom, player, { allowUnknown: true });
 
 test('inspect a valid generated ROM', t => {
   const { rom } = fixture(t);
@@ -60,7 +66,7 @@ test('larger mapped monochrome ROM with a 16-character title', t => {
   assert.equal(rom.title, 'SIXTEENCHARTITLE');
   assert.equal(rom.size_bytes, 262144);
   assert.equal(rom.global_checksum_valid, true);
-  flash(new FakeSession(rom), rom, 1);
+  tryUnverified(new FakeSession(rom), rom);
 });
 
 test('bad header is rejected before device access', async t => {
@@ -89,7 +95,7 @@ test('corrupted payload blocks writing before device access', async t => {
 test('known stale global checksum can be explicitly allowed', async t => {
   const { path, data } = fixture(t);
   data[data.length - 1] = 1; writeFileSync(path, data);
-  assert.equal(await main(['flash', path, '--dry-run', '--allow-invalid-global-checksum'], { ...quiet, sessionFactory: mustNotAccessDevice }), 0);
+  assert.equal(await main(['flash', path, '--dry-run', '--allow-invalid-global-checksum', '--allow-unknown-compatibility'], { ...quiet, sessionFactory: mustNotAccessDevice }), 0);
 });
 
 test('dry run needs no CLI and safely quotes paths', async t => {
@@ -97,22 +103,29 @@ test('dry run needs no CLI and safely quotes paths', async t => {
   const special = join(dir, "Game's $(literal).gbc");
   writeFileSync(special, readFileSync(path));
   const output = [];
-  await main(['flash', special, '--dry-run'], { sessionFactory: mustNotAccessDevice, print: text => output.push(text) });
+  await main(['flash', special, '--dry-run', '--allow-unknown-compatibility'], { sessionFactory: mustNotAccessDevice, print: text => output.push(text) });
   assert.match(output[1], /Game'\\''s \$\(literal\)/);
+  assert.match(output[1], /^npm run flash --/);
+  assert.match(output[1], /--allow-unknown-compatibility/);
   assert.match(output[2], /no CLI commands or USB/);
 });
 
 test('declining confirmation never accesses the device', async t => {
   const { path } = fixture(t);
-  assert.equal(await main(['flash', path], { ...quiet, ask: async () => false, sessionFactory: mustNotAccessDevice }), 0);
+  assert.equal(await main(['flash', path, '--allow-unknown-compatibility'], { ...quiet, ask: async () => false, sessionFactory: mustNotAccessDevice }), 0);
 });
 
 test('flash supplies the exact hash, checks the header, and restores the device', t => {
   const { rom, path } = fixture(t);
   const session = new FakeSession(rom);
-  flash(session, rom, 1);
+  const verification = tryUnverified(session, rom);
   assert.deepEqual(session.operations(), ['list-devices', 'detect-cart', 'write-homebrew', 'detect-cart', 'reset-device']);
   assert.deepEqual(session.calls[2].options, [realpathSync(path), '--expect-sha256', rom.sha256, '--player', '1']);
+  assert.equal(verification.cli_player_and_host_hash, 'matched');
+  assert.equal(verification.full_flash_readback, 'unavailable_in_cli_1.2.1');
+  assert.equal(verification.gameplay, 'not_tested_by_this_run');
+  assert.equal(session.saved.get('compatibility').unknown_compatibility_override, true);
+  assert.deepEqual(session.saved.get('verification'), verification);
 });
 
 for (const [name, options, pattern] of [
@@ -121,7 +134,7 @@ for (const [name, options, pattern] of [
 ]) test(`${name} prevents writing`, t => {
   const { rom } = fixture(t);
   const session = new FakeSession(rom, options);
-  assert.throws(() => flash(session, rom, 1), pattern);
+  assert.throws(() => tryUnverified(session, rom), pattern);
   assert.equal(session.operations().includes('write-homebrew'), false);
   assert.equal(session.operations().at(-1), 'reset-device');
 });
@@ -129,34 +142,34 @@ for (const [name, options, pattern] of [
 test('missing player prevents reset and write', t => {
   const { rom } = fixture(t);
   const session = new FakeSession(rom);
-  assert.throws(() => flash(session, rom, 2), /player number 2/);
+  assert.throws(() => tryUnverified(session, rom, 2), /player number 2/);
   assert.deepEqual(session.operations(), ['list-devices']);
 });
 
 test('header mismatch reports failure and resets', t => {
   const { rom } = fixture(t);
   const session = new FakeSession(rom, { badHeader: true });
-  assert.throws(() => flash(session, rom, 1), /global_checksum/);
+  assert.throws(() => tryUnverified(session, rom), /global_checksum/);
   assert.equal(session.operations().at(-1), 'reset-device');
 });
 
 test('failed write restores the device and skips verification', t => {
   const { rom } = fixture(t);
   const session = new FakeSession(rom, { failWrite: true });
-  assert.throws(() => flash(session, rom, 1), /simulated write failure/);
+  assert.throws(() => tryUnverified(session, rom), /simulated write failure/);
   assert.deepEqual(session.operations(), ['list-devices', 'detect-cart', 'write-homebrew', 'reset-device']);
 });
 
 test('reset failure preserves the original write error', t => {
   const { rom } = fixture(t);
   const session = new FakeSession(rom, { failWrite: true, failReset: true });
-  assert.throws(() => flash(session, rom, 1), /simulated write failure/);
+  assert.throws(() => tryUnverified(session, rom), /simulated write failure/);
   assert.match(session.warnings[0], /reset also failed/);
 });
 
 test('reset failure after a successful write is reported', t => {
   const { rom } = fixture(t);
-  assert.throws(() => flash(new FakeSession(rom, { failReset: true }), rom, 1), /simulated reset failure/);
+  assert.throws(() => tryUnverified(new FakeSession(rom, { failReset: true }), rom), /simulated reset failure/);
 });
 
 test('detect restores normal mode without writing', async t => {
@@ -226,4 +239,140 @@ test('Linux root setup does not require sudo', () => {
     return { status: 0 };
   } });
   assert.equal(executable, process.execPath);
+});
+
+test('--yes alone never bypasses unknown compatibility, even for a dry run', async t => {
+  const { path } = fixture(t);
+  for (const flags of [['--yes'], ['--yes', '--dry-run']]) {
+    await assert.rejects(main(['flash', path, ...flags], { ...quiet, sessionFactory: mustNotAccessDevice }), /--allow-unknown-compatibility/);
+  }
+});
+
+test('inspection gives readable requirements and an offline report without CLI access', async t => {
+  const { path } = fixture(t, { sizeCode: 2, type: 0x03, ram: 3 });
+  const output = [];
+  await main(['inspect', path], { sessionFactory: mustNotAccessDevice, print: text => output.push(text) });
+  assert.match(output[0], /MBC1\+RAM\+BATTERY/);
+  assert.match(output[0], /persistent save: true/);
+  assert.match(output[0], /Compatibility: UNKNOWN/);
+  assert.match(output[0], /not checked \(offline\)/);
+});
+
+test('JSON inspection preserves raw header metadata alongside the compatibility report', async t => {
+  const { path } = fixture(t);
+  const output = [];
+  await main(['inspect', path, '--json'], { sessionFactory: mustNotAccessDevice, print: text => output.push(text) });
+  assert.equal(output.length, 1);
+  const parsed = JSON.parse(output[0]);
+  assert.equal(parsed.cartridge_type_code, 0);
+  assert.equal(parsed.compatibility.profile_id, 'devday-demo');
+  assert.equal(parsed.compatibility.hardware_match, 'not_checked');
+});
+
+test('connected check detects and resets but never writes, returning 2 for unknown support', async t => {
+  const { path, rom } = fixture(t);
+  const session = new FakeSession(rom);
+  const output = [];
+  assert.equal(await main(['check', path, '--yes', '--json'], { sessionFactory: () => session, print: text => output.push(text) }), 2);
+  assert.deepEqual(session.operations(), ['list-devices', 'detect-cart', 'reset-device']);
+  assert.equal(output.length, 1);
+  assert.equal(JSON.parse(output[0]).compatibility.hardware_match, 'matched');
+});
+
+test('connected check reports an incompatible chip and exit 1 without writing', async t => {
+  const { path, rom } = fixture(t);
+  const session = new FakeSession(rom, { flashOverrides: { model: 'other chip' } });
+  assert.equal(await main(['check', path, '--yes'], { ...quiet, sessionFactory: () => session }), 1);
+  assert.deepEqual(session.operations(), ['list-devices', 'detect-cart', 'reset-device']);
+});
+
+test('connected check returns 1 for an invalid global checksum and never writes', async t => {
+  const { path, data } = fixture(t);
+  data[data.length - 1] ^= 1;
+  writeFileSync(path, data);
+  const session = new FakeSession(inspectRom(path));
+  const output = [];
+  assert.equal(await main(['check', path, '--yes'], { sessionFactory: () => session, print: text => output.push(text) }), 1);
+  assert.match(output[0], /Global checksum: INVALID/);
+  assert.deepEqual(session.operations(), ['list-devices', 'detect-cart', 'reset-device']);
+});
+
+test('main passes the explicit compatibility override through the guarded flash workflow', async t => {
+  const { path, rom } = fixture(t);
+  const session = new FakeSession(rom);
+  const output = [];
+  assert.equal(await main(['flash', path, '--yes', '--allow-unknown-compatibility'], {
+    sessionFactory: () => session, print: text => output.push(text),
+  }), 0);
+  assert.equal(session.saved.get('compatibility').status, 'unknown');
+  assert.equal(session.saved.get('compatibility').unknown_compatibility_override, true);
+  assert.equal(session.saved.get('verification').outcome, 'completed');
+  assert.match(output.at(-1), /Full-flash readback, gameplay, and save persistence were not tested/);
+});
+
+test('cancelling a connected check never touches the CLI', async t => {
+  const { path } = fixture(t);
+  assert.equal(await main(['check', path], { ...quiet, ask: async () => false, sessionFactory: mustNotAccessDevice }), 0);
+});
+
+test('a supported exact-ROM check still checks the physical chip', t => {
+  const { rom } = fixture(t, { cgbFlag: 0xc0 });
+  const testedRom = { ...rom, sha256: DEMO_CARTRIDGE.tested_roms[0].sha256 };
+  const session = new FakeSession(testedRom);
+  assert.equal(check(session, testedRom, 1).status, 'supported');
+  const wrongChip = new FakeSession(testedRom, { flashOverrides: { make: 'other maker' } });
+  assert.equal(check(wrongChip, testedRom, 1).status, 'incompatible');
+});
+
+for (const [field, value] of [['make', 'other maker'], ['model', 'other model'], ['capacity_bytes', 8388608], ['sector_size_bytes', 32768]]) {
+  test(`unknown override cannot bypass a demo chip ${field} mismatch`, t => {
+    const { rom } = fixture(t);
+    const session = new FakeSession(rom, { flashOverrides: { [field]: value } });
+    assert.throws(() => tryUnverified(session, rom), /does not match the demo flash profile/);
+    assert.equal(session.operations().includes('write-homebrew'), false);
+    assert.equal(session.operations().at(-1), 'reset-device');
+    assert.equal(session.saved.get('verification').outcome, 'failed');
+  });
+}
+
+test('a post-write chip mismatch fails verification and still resets', t => {
+  const { rom } = fixture(t);
+  const session = new FakeSession(rom, { afterFlashOverrides: { model: 'different chip' } });
+  assert.throws(() => tryUnverified(session, rom), /does not match the demo flash profile/);
+  assert.equal(session.operations().at(-1), 'reset-device');
+  assert.equal(session.saved.get('verification').cartridge_header, 'not_checked');
+  assert.equal(session.saved.get('verification').cartridge_profile_before, 'matched');
+  assert.equal(session.saved.get('verification').cartridge_profile_after, 'mismatched');
+  assert.equal(session.saved.get('compatibility-after').status, 'incompatible');
+});
+
+for (const [name, writeResult, pattern] of [
+  ['wrong player', { player: 2 }, /player number/],
+  ['missing player', { player: undefined }, /player number/],
+  ['wrong hash', { romSha256: '0'.repeat(64) }, /host ROM SHA-256/],
+  ['missing hash', { romSha256: undefined }, /host ROM SHA-256/],
+]) test(`a successful-looking write with ${name} fails and resets`, t => {
+  const { rom } = fixture(t);
+  const session = new FakeSession(rom, { writeResult });
+  assert.throws(() => tryUnverified(session, rom), pattern);
+  assert.deepEqual(session.operations(), ['list-devices', 'detect-cart', 'write-homebrew', 'reset-device']);
+  assert.equal(session.saved.get('verification').cli_player_and_host_hash, 'not_checked');
+  assert.equal(session.saved.get('verification').outcome, 'failed');
+});
+
+test('a response for a different CLI operation is rejected', t => {
+  const { session } = simulatedSession(t, { schema_version: 1, ok: true, operation: 'write-homebrew', result: {} });
+  assert.throws(() => session.run('detect-cart'), /different operation/);
+});
+
+test('a valid CLI response with the expected operation is accepted', t => {
+  const { session } = simulatedSession(t, { schema_version: 1, ok: true, operation: 'detect-cart', result: { cartridge: {} } });
+  assert.deepEqual(session.run('detect-cart'), { cartridge: {} });
+});
+
+test('an oversized ROM is blocked offline even with both override flags', async t => {
+  const { path } = fixture(t, { sizeCode: 8, type: 0x19 });
+  await assert.rejects(main(['flash', path, '--yes', '--allow-unknown-compatibility', '--dry-run'], {
+    ...quiet, sessionFactory: mustNotAccessDevice,
+  }), /Incompatible.*flash bytes/);
 });

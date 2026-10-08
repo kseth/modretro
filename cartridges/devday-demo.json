@@ -1,0 +1,41 @@
+{
+  "id": "devday-demo",
+  "name": "Codex / OpenAI DevDay Chromatic demo cartridge",
+  "flash": {
+    "make": "ISSI",
+    "model": "IS29GL032-70TLET-TR",
+    "capacity_bytes": 4194304,
+    "sector_size_bytes": 65536
+  },
+  "capabilities": {
+    "mappers": {},
+    "memory": {},
+    "max_ram_bytes": null,
+    "persistent_save": null,
+    "rtc": null,
+    "accelerometer": null,
+    "camera": null,
+    "special_hardware": null,
+    "rumble": null,
+    "infrared": null
+  },
+  "evidence": [
+    "Flash identity/capacity/sector size observed through chromatic-cli 1.2.1 detect-cart --all on this DevDay demo cartridge.",
+    "No independent mapper, RAM, persistent-save, clock, or peripheral specification has been established. Missing or null capabilities mean unknown, not unsupported.",
+    "Matching this flash chip does not uniquely identify the cartridge PCB. The operator must use the included DevDay demo cartridge."
+  ],
+  "tested_roms": [
+    {
+      "title": "Sun's Dojo v3",
+      "sha256": "c9e8a2ff61abcd4d9dc7894b79942b826e0618460b34d0d38c6132a946d0e270",
+      "rom_bytes": 32768,
+      "cartridge_type_code": 0,
+      "ram_size_code": 0,
+      "cgb_flag": 192,
+      "checks": { "mapper": true },
+      "boot_and_play": "User confirmed successful play after flashing; this ROM uses no banking or cartridge RAM.",
+      "environment": "macOS; chromatic-cli 1.2.1; Chromatic firmware 4.6",
+      "scope": "Evidence applies only to this exact ROM hash on the observed demo cartridge. It does not establish support for other ROMs or mapper families."
+    }
+  ]
+}

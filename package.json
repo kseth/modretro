@@ -11,6 +11,7 @@
     "devices": "node modretro.mjs devices",
     "drivers": "node modretro.mjs drivers",
     "inspect": "node modretro.mjs inspect",
+    "check": "node modretro.mjs check",
     "detect": "node modretro.mjs detect",
     "flash": "node modretro.mjs flash",
     "cli": "chromatic-cli",
