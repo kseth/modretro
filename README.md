@@ -210,7 +210,58 @@ a failure does not roll back an already started cartridge write.
 
 For a known stale whole-ROM checksum, use `--allow-invalid-global-checksum`.
 An invalid header checksum or inconsistent file length always stops the tool;
-files are never patched. See the [Game Boy header specification](https://github.com/gbdev/pandocs/blob/master/src/The_Cartridge_Header.md).
+inspection and flashing never patch files. See the [Game Boy header specification](https://github.com/gbdev/pandocs/blob/master/src/The_Cartridge_Header.md).
+
+### Optional ROM metadata preparation
+
+For development and testing with the CLI's `write-homebrew` workflow, `prepare`
+creates a separate ROM copy with a local revision marker and valid standard
+GB/GBC checksums. The original file is preserved:
+
+```sh
+npm run prepare -- "/path/to/game.gbc"
+```
+
+This offline command creates `roms/game.devday-copy.gbc` and an adjacent
+`.gbc.json` manifest. Both stay in the ignored `roms/` directory. Use
+`--output "/path/to/copy.gbc"` to choose another destination. Existing copies,
+manifests, and symlinks are rejected rather than overwritten. Retain the original
+ROM separately; repeating the command on that original produces identical ROM
+bytes.
+
+Only the mask-ROM revision byte at `0x014C` is incremented (wrapping at 255), and
+the header/global checksums at `0x014D–0x014F` are recomputed. All other bytes,
+including code, graphics, title, mapper, RAM size, color mode, and ROM size, remain
+identical. The revision identifies a locally prepared copy rather than a newer
+game release. This operation changes header metadata; it does not encrypt or
+decrypt ROM content, modify game instructions, or patch the vendor CLI.
+The source must already pass both checksum checks; this command does not repair
+corrupted downloads. The manifest records source/copy SHA-256 and SHA-1 hashes,
+headers, requirements, and every byte difference. See
+[Pan Docs' revision and checksum fields](https://github.com/gbdev/pandocs/blob/master/src/The_Cartridge_Header.md#014c--mask-rom-version-number).
+
+Homebrew and commercial games use the same GB/GBC header format. Updating these
+fields does not turn a commercial game into homebrew or establish a new
+compatibility specification. The changed bytes produce different whole-file
+hashes, which can affect the CLI's hash-based released-title classification.
+CLI acceptance and behavior of games that read their own headers require
+separate testing.
+
+Preparation runs offline and leaves the vendor CLI untouched. It does not
+download firmware or access USB. Inspect the prepared copy and use the normal
+flashing workflow when ready:
+
+```sh
+npm run inspect -- "roms/game.devday-copy.gbc"
+npm run flash -- "roms/game.devday-copy.gbc" --dry-run --allow-unknown-compatibility
+# With the prepared Chromatic and actual DevDay demo cartridge connected:
+npm run flash -- "roms/game.devday-copy.gbc" --player 1 --allow-unknown-compatibility
+```
+
+The chip identity, capacity, checksums, expected SHA-256, and post-write header
+checks still apply. MBC5 banking, cartridge RAM, and save persistence remain
+unknown for our demo profile until independently tested on hardware. A successful
+write alone is insufficient evidence to mark a game supported.
 
 Other commands:
 
@@ -230,12 +281,13 @@ connected device.
 
 | Path | Purpose |
 | --- | --- |
-| `modretro.mjs`, `compatibility.mjs`, `package.json`, `package-lock.json`, `.npmrc` | Reusable Node workflow, requirement decoding, and dependency configuration |
+| `modretro.mjs`, `compatibility.mjs`, `prepare-rom.mjs`, `package.json`, `package-lock.json`, `.npmrc` | Reusable Node workflow, requirement decoding, optional copy preparation, and dependency configuration |
 | `cartridges/devday-demo.json` | Observed demo chip identity, capability evidence, and exact-ROM test metadata |
 | `tests/` | Offline Node tests using generated data, never game files |
 | `node_modules/` | Local vendor CLI installation |
 | `tools/` | npm cache and CLI temporary files |
 | `logs/` | Per-operation commands, results, ROM paths/hashes, and headers |
+| `roms/` | Optional local ROM copies and their byte-difference/hash manifests |
 | `downloads/` | Historical CLI archives from the initial setup |
 
 `.gitignore` excludes ROMs, binaries, downloads, caches, and logs. Original run
@@ -253,6 +305,9 @@ online workflow rather than a complete offline firmware bundle.
 - No device: check power, USB data cable, and `npm run devices`.
 - Linux permission errors: run `npm run drivers`, then reconnect the device.
 - Download failure: allow access to npm and ModRetro's firmware service.
+- `rom.released_title_denied`: the vendor CLI matched the file's SHA-1 to its
+  released-title list. This classification is separate from GB/GBC header
+  validity, Developer Mode activation, and cartridge compatibility.
 - Unknown compatibility: inspect the requirements and profile evidence. Only a
   deliberate trial should use `--allow-unknown-compatibility`.
 - Demo chip mismatch: insert the supplied DevDay demo cartridge; overrides do
@@ -272,6 +327,14 @@ write was exercised on macOS with CLI 1.2.1, Chromatic firmware 4.6, and a 32 Ki
 ROM on the DevDay cartridge. The
 new compatibility checks and Node wrapper have been tested offline; hardware
 flashing through this revision and Linux hardware use have not been tested here.
+
+Separate preflight probes with CLI 1.2.1 and the device disconnected recorded
+`rom.released_title_denied` for two original ROMs and `device.player_not_found`
+for their prepared copies, using absent player 255. Incorrect expected SHA-256
+values returned `rom.sha256_mismatch`. These results establish the observed CLI
+classification and host-hash checks only; no cartridge write or gameplay was
+tested. Preparation and the offline test suite do not run these network-dependent
+probes.
 
 ### Extending cartridge evidence
 
